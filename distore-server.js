@@ -270,40 +270,69 @@ async function setupDatabase() {
     )
   `);
 
-  // ── New tables for v3.1 features ───────────────────────────
-  await q(`
-    CREATE TABLE IF NOT EXISTS injected_modules (
-      id          SERIAL PRIMARY KEY,
-      shop_id     INTEGER REFERENCES shops(id) ON DELETE CASCADE,
-      module_id   TEXT NOT NULL,
-      label       TEXT NOT NULL,
-      type        TEXT NOT NULL DEFAULT 'panel',
-      html        TEXT NOT NULL DEFAULT '',
-      css         TEXT NOT NULL DEFAULT '',
-      js          TEXT NOT NULL DEFAULT '',
-      menu_icon   TEXT NOT NULL DEFAULT '🔧',
-      menu_label  TEXT NOT NULL DEFAULT 'Module',
-      menu_section TEXT NOT NULL DEFAULT 'modules',
-      active      INTEGER NOT NULL DEFAULT 1,
-      created_by  INTEGER REFERENCES master_users(id),
-      created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
-      updated_at  TIMESTAMP NOT NULL DEFAULT NOW(),
-      UNIQUE(shop_id, module_id)
-    )
-  `);
+  // ── Device lock state ─────────────────────────────────────────
+  await q(`CREATE TABLE IF NOT EXISTS device_locks (
+    id          SERIAL PRIMARY KEY,
+    shop_id     INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+    device_id   TEXT,
+    locked      INTEGER NOT NULL DEFAULT 1,
+    message     TEXT,
+    contact     TEXT,
+    phone       TEXT,
+    locked_by   INTEGER REFERENCES master_users(id),
+    locked_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    unlocked_at TIMESTAMP
+  )`);
 
-  await q(`
-    CREATE TABLE IF NOT EXISTS pending_locks (
-      id          SERIAL PRIMARY KEY,
-      shop_id     INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
-      device_id   TEXT,
-      command     TEXT NOT NULL,
-      payload     TEXT NOT NULL DEFAULT '{}',
-      issued_by   INTEGER REFERENCES master_users(id),
-      issued_at   TIMESTAMP NOT NULL DEFAULT NOW(),
-      executed_at TIMESTAMP
-    )
-  `);
+  await q(`CREATE TABLE IF NOT EXISTS modules (
+    id           SERIAL PRIMARY KEY,
+    module_id    TEXT NOT NULL,
+    shop_id      INTEGER REFERENCES shops(id) ON DELETE CASCADE,
+    device_id    TEXT,
+    name         TEXT NOT NULL,
+    description  TEXT,
+    html         TEXT,
+    css          TEXT,
+    js           TEXT,
+    mount_point  TEXT DEFAULT 'app',
+    active       INTEGER NOT NULL DEFAULT 1,
+    force_reload INTEGER NOT NULL DEFAULT 0,
+    created_by   INTEGER REFERENCES master_users(id),
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS patches (
+    id         SERIAL PRIMARY KEY,
+    patch_id   TEXT NOT NULL UNIQUE,
+    shop_id    INTEGER REFERENCES shops(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    selector   TEXT,
+    action     TEXT DEFAULT 'append',
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_by INTEGER REFERENCES master_users(id),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS server_config (
+    id        SERIAL PRIMARY KEY,
+    label     TEXT NOT NULL,
+    url       TEXT NOT NULL UNIQUE,
+    is_active INTEGER NOT NULL DEFAULT 0,
+    added_by  INTEGER REFERENCES master_users(id),
+    added_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    notes     TEXT
+  )`);
+
+  await q(`CREATE TABLE IF NOT EXISTS support_config (
+    id         SERIAL PRIMARY KEY,
+    key        TEXT NOT NULL UNIQUE,
+    value      TEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+  )`);
+
+  await q(`INSERT INTO support_config(key,value) VALUES('contact','evansmaina2026@gmail.com'),('phone','0114698986'),('name','Dilly Solutions') ON CONFLICT(key) DO NOTHING`);
 
   // Indexes
   await q(`CREATE INDEX IF NOT EXISTS idx_devices_shop     ON devices(shop_id)`);
@@ -786,7 +815,19 @@ app.delete('/api/master/devices/:deviceId', authMaster, async (req, res) => {
   ok(res, null, 'Removed');
 });
 
-// ── Remote Commands — handled in MODULE INJECTION section above ─
+// ── Remote Commands ───────────────────────────────────────────
+app.post('/api/master/shops/:id/command', authMaster, async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { command, device_id, payload } = req.body;
+  const valid = ['LOCK_POS','UNLOCK_POS','FORCE_LOGOUT','RELOAD_APP','MESSAGE','SHOP_SUSPENDED'];
+  if (!valid.includes(command)) return err(res, 'Invalid command');
+  await q('INSERT INTO remote_commands(shop_id,device_id,command,payload,issued_by) VALUES($1,$2,$3,$4,$5)',
+    [id, device_id||null, command, JSON.stringify(payload||{}), req.master.id]);
+  if (device_id) broadcastToDevice(device_id, 'remote_command', { command, payload: payload||{} });
+  else broadcastToShop(id, 'remote_command', { command, payload: payload||{} });
+  await audit(req.master.email, 'REMOTE_CMD', command, `shop:${id}`, req.ip);
+  ok(res, null, `Command ${command} sent`);
+});
 
 // ── Audit ─────────────────────────────────────────────────────
 app.get('/api/master/audit', authMaster, async (req, res) => {
@@ -1007,164 +1048,6 @@ app.post('/api/pos/heartbeat', authDevice, async (req, res) => {
   } catch(e) { err(res, e.message, 500); }
 });
 
-// ══════════════════════════════════════════════════════════════
-//  MODULE INJECTION API
-// ══════════════════════════════════════════════════════════════
-
-// List modules for a shop
-app.get('/api/master/shops/:id/modules', authMaster, async (req, res) => {
-  try {
-    const shopId = parseInt(req.params.id);
-    const mods = await qAll('SELECT id,module_id,label,type,menu_icon,menu_label,menu_section,active,created_at,updated_at FROM injected_modules WHERE shop_id=$1 ORDER BY created_at DESC', [shopId]);
-    ok(res, mods);
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// Create/update module
-app.post('/api/master/shops/:id/modules', authMaster, async (req, res) => {
-  try {
-    const shopId = parseInt(req.params.id);
-    const { module_id, label, type, html, css, js, menu_icon, menu_label, menu_section } = req.body;
-    if (!module_id || !label) return err(res, 'module_id and label required');
-    const modId = module_id.replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
-    await q(`INSERT INTO injected_modules(shop_id,module_id,label,type,html,css,js,menu_icon,menu_label,menu_section,created_by)
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-             ON CONFLICT(shop_id,module_id) DO UPDATE SET label=$3,type=$4,html=$5,css=$6,js=$7,menu_icon=$8,menu_label=$9,menu_section=$10,active=1,updated_at=NOW()`,
-      [shopId, modId, label, type||'panel', html||'', css||'', js||'', menu_icon||'🔧', menu_label||label, menu_section||'modules', req.master.id]);
-    // Push to connected devices immediately
-    const mod = await qOne('SELECT * FROM injected_modules WHERE shop_id=$1 AND module_id=$2', [shopId, modId]);
-    broadcastToShop(shopId, 'module_injected', { module: mod });
-    await audit(req.master.email, 'MODULE_INJECT', modId, `shop:${shopId}`, req.ip);
-    ok(res, mod, 'Module pushed to devices');
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// Toggle module active
-app.post('/api/master/shops/:id/modules/:moduleId/toggle', authMaster, async (req, res) => {
-  try {
-    const shopId = parseInt(req.params.id);
-    const mod = await qOne('SELECT * FROM injected_modules WHERE shop_id=$1 AND module_id=$2', [shopId, req.params.moduleId]);
-    if (!mod) return err(res, 'Module not found', 404);
-    const newActive = mod.active ? 0 : 1;
-    await q('UPDATE injected_modules SET active=$1 WHERE shop_id=$2 AND module_id=$3', [newActive, shopId, req.params.moduleId]);
-    broadcastToShop(shopId, newActive ? 'module_injected' : 'module_removed', { module_id: req.params.moduleId, module: newActive ? mod : null });
-    await audit(req.master.email, newActive ? 'MODULE_ENABLE' : 'MODULE_DISABLE', req.params.moduleId, `shop:${shopId}`, req.ip);
-    ok(res, null, newActive ? 'Module enabled' : 'Module disabled');
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// Delete module
-app.delete('/api/master/shops/:id/modules/:moduleId', authMaster, async (req, res) => {
-  try {
-    const shopId = parseInt(req.params.id);
-    await q('DELETE FROM injected_modules WHERE shop_id=$1 AND module_id=$2', [shopId, req.params.moduleId]);
-    broadcastToShop(shopId, 'module_removed', { module_id: req.params.moduleId });
-    await audit(req.master.email, 'MODULE_DELETE', req.params.moduleId, `shop:${shopId}`, req.ip);
-    ok(res, null, 'Module removed from all devices');
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// POS pulls its active modules on sync
-app.get('/api/pos/modules', authDevice, async (req, res) => {
-  try {
-    const mods = await qAll("SELECT * FROM injected_modules WHERE (shop_id=$1 OR shop_id IS NULL) AND active=1 ORDER BY created_at ASC", [req.shopId]);
-    ok(res, mods);
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// ══════════════════════════════════════════════════════════════
-//  DB MIGRATION / EXPORT (for moving between servers)
-// ══════════════════════════════════════════════════════════════
-
-// Export all cloud_backups for a shop (so you can move servers without losing data)
-app.get('/api/master/shops/:id/export-db', authMaster, async (req, res) => {
-  try {
-    const shopId = parseInt(req.params.id);
-    const shop   = await qOne('SELECT * FROM shops WHERE id=$1', [shopId]);
-    if (!shop) return err(res, 'Shop not found', 404);
-    const backups = await qAll('SELECT * FROM cloud_backups WHERE shop_id=$1', [shopId]);
-    const devices = await qAll('SELECT * FROM devices WHERE shop_id=$1', [shopId]);
-    const mods    = await qAll('SELECT * FROM injected_modules WHERE shop_id=$1', [shopId]);
-    const locks   = await qAll("SELECT * FROM remote_commands WHERE shop_id=$1 AND status='PENDING'", [shopId]);
-    const exportData = {
-      exported_at:  new Date().toISOString(),
-      shop:         { ...shop, features: JSON.parse(shop.features||'{}') },
-      backups, devices, modules: mods, pending_commands: locks,
-    };
-    await audit(req.master.email, 'SHOP_EXPORT', shop.name, `shopId:${shopId}`, req.ip);
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="distore-shop-${shopId}-${Date.now()}.json"`);
-    res.send(JSON.stringify(exportData, null, 2));
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// Import shop data (when switching servers — paste JSON from export)
-app.post('/api/master/shops/:id/import-db', authSuper, async (req, res) => {
-  try {
-    const shopId     = parseInt(req.params.id);
-    const { backups, devices, modules, pending_commands } = req.body;
-    let imported = { backups:0, devices:0, modules:0, commands:0 };
-
-    if (Array.isArray(backups)) {
-      for (const b of backups) {
-        await q(`INSERT INTO cloud_backups(shop_id,device_id,store_name,data,record_count,synced_at)
-                 VALUES($1,$2,$3,$4,$5,$6)
-                 ON CONFLICT(shop_id,device_id,store_name) DO UPDATE SET data=EXCLUDED.data,record_count=EXCLUDED.record_count,synced_at=EXCLUDED.synced_at`,
-          [shopId, b.device_id, b.store_name, b.data, b.record_count||0, b.synced_at||new Date().toISOString()]);
-        imported.backups++;
-      }
-    }
-    if (Array.isArray(devices)) {
-      for (const d of devices) {
-        await q(`INSERT INTO devices(device_id,shop_id,name,type,os,browser,ip_address,status,pos_user,last_seen,registered_at,approved_at)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                 ON CONFLICT(device_id) DO NOTHING`,
-          [d.device_id, shopId, d.name, d.type, d.os, d.browser, d.ip_address, d.status, d.pos_user, d.last_seen, d.registered_at, d.approved_at]);
-        imported.devices++;
-      }
-    }
-    if (Array.isArray(modules)) {
-      for (const m of modules) {
-        await q(`INSERT INTO injected_modules(shop_id,module_id,label,type,html,css,js,menu_icon,menu_label,menu_section,active)
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                 ON CONFLICT(shop_id,module_id) DO UPDATE SET html=EXCLUDED.html,css=EXCLUDED.css,js=EXCLUDED.js,updated_at=NOW()`,
-          [shopId, m.module_id, m.label, m.type, m.html, m.css, m.js, m.menu_icon, m.menu_label, m.menu_section, m.active||1]);
-        imported.modules++;
-      }
-    }
-    if (Array.isArray(pending_commands)) {
-      for (const c of pending_commands) {
-        await q(`INSERT INTO remote_commands(shop_id,device_id,command,payload,status,issued_at) VALUES($1,$2,$3,$4,'PENDING',$5)`,
-          [shopId, c.device_id||null, c.command, c.payload||'{}', c.issued_at||new Date().toISOString()]);
-        imported.commands++;
-      }
-    }
-    await audit(req.master.email, 'SHOP_IMPORT', `shopId:${shopId}`, JSON.stringify(imported), req.ip);
-    ok(res, imported, `Import complete: ${imported.backups} backups, ${imported.devices} devices, ${imported.modules} modules`);
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// ══════════════════════════════════════════════════════════════
-//  EXTENDED REMOTE COMMANDS (feature locking, etc.)
-// ══════════════════════════════════════════════════════════════
-// Replaces the old /api/master/shops/:id/command to add more commands
-app.post('/api/master/shops/:id/command', authMaster, async (req, res) => {
-  const id = parseInt(req.params.id);
-  const { command, device_id, payload } = req.body;
-  const valid = [
-    'LOCK_POS','UNLOCK_POS','FORCE_LOGOUT','RELOAD_APP','MESSAGE','SHOP_SUSPENDED',
-    'LOCK_FEATURE','UNLOCK_FEATURE','LOCK_ALL_FEATURES','UNLOCK_ALL_FEATURES',
-    'CLEAR_CART','RESTRICT_CASHIER',
-  ];
-  if (!valid.includes(command)) return err(res, 'Invalid command');
-  await q('INSERT INTO remote_commands(shop_id,device_id,command,payload,issued_by) VALUES($1,$2,$3,$4,$5)',
-    [id, device_id||null, command, JSON.stringify(payload||{}), req.master.id]);
-  if (device_id) broadcastToDevice(device_id, 'remote_command', { command, payload: payload||{} });
-  else broadcastToShop(id, 'remote_command', { command, payload: payload||{} });
-  await audit(req.master.email, 'REMOTE_CMD', command, `shop:${id} device:${device_id||'all'}`, req.ip);
-  ok(res, null, `Command ${command} sent`);
-});
-
 // ── Public info ────────────────────────────────────────────────
 app.get('/api/info', async (req, res) => {
   try {
@@ -1175,6 +1058,226 @@ app.get('/api/info', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Distore Server</title><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0e;color:#e8eaf0;font-family:monospace;display:flex;align-items:center;justify-content:center;min-height:100vh}.b{border:1px solid #2a2f3a;padding:40px;border-radius:12px;text-align:center;max-width:380px}h1{font-size:30px;color:#00d4aa;font-weight:900}p{color:#5a6478;font-size:12px;margin:6px 0}a{color:#00d4aa;text-decoration:none;padding:10px 20px;border:1px solid #00d4aa;border-radius:6px;display:inline-block;margin:6px 4px;font-size:12px}a:hover{background:rgba(0,212,170,.1)}</style></head><body><div class="b"><h1>DISTORE</h1><p>Master Server v3.0 · ✅ Running on Render</p><p style="font-size:10px;color:#2a2f3a;margin-top:4px">by Dilly Solutions</p><div style="margin-top:20px"><a href="/api/info">📊 API Status</a></div></div></body></html>`));
+
+
+// ══════════════════════════════════════════════════════════════
+//  ENFORCEMENT API
+// ══════════════════════════════════════════════════════════════
+app.get('/api/pos/enforcements', authDevice, async (req, res) => {
+  try {
+    const shopId = req.shopId, deviceId = req.device.device_id;
+    const lock = await qOne(`SELECT * FROM device_locks WHERE shop_id=$1 AND locked=1 AND (device_id IS NULL OR device_id=$2) ORDER BY locked_at DESC LIMIT 1`, [shopId, deviceId]);
+    const support = await qAll('SELECT key,value FROM support_config');
+    const supMap = {}; support.forEach(s => { supMap[s.key] = s.value; });
+    if (lock) {
+      return ok(res, { pos_locked:true, lock_data:{ message:lock.message||'POS locked by administrator.', contact:lock.contact||supMap.contact||'evansmaina2026@gmail.com', phone:lock.phone||supMap.phone||'0114698986', locked_at:lock.locked_at } });
+    }
+    const shop = await qOne('SELECT features FROM shops WHERE id=$1', [shopId]);
+    const features = JSON.parse(shop?.features || '{}');
+    const modules = await qAll(`SELECT * FROM modules WHERE active=1 AND (shop_id=$1 OR shop_id IS NULL) AND (device_id=$2 OR device_id IS NULL) ORDER BY created_at ASC`, [shopId, deviceId]);
+    const patches = await qAll(`SELECT * FROM patches WHERE active=1 AND (shop_id=$1 OR shop_id IS NULL) ORDER BY created_at ASC`, [shopId]);
+    const cmds = await qAll(`SELECT * FROM remote_commands WHERE shop_id=$1 AND status='PENDING' AND (device_id IS NULL OR device_id=$2) ORDER BY issued_at ASC`, [shopId, deviceId]);
+    if (cmds.length) await q(`UPDATE remote_commands SET status='DELIVERED',delivered_at=NOW() WHERE id=ANY($1)`, [cmds.map(c=>c.id)]);
+    const newServer = await qOne("SELECT url,label FROM server_config WHERE is_active=1 ORDER BY added_at DESC LIMIT 1");
+    ok(res, {
+      pos_locked:false, features,
+      modules: modules.map(m=>({id:m.module_id,name:m.name,html:m.html,css:m.css,js:m.js,mount_point:m.mount_point,force_reload:m.force_reload===1})),
+      patches: patches.map(p=>({id:p.patch_id,type:p.type,content:p.content,selector:p.selector,action:p.action})),
+      commands: cmds.map(c=>({command:c.command,payload:JSON.parse(c.payload||'{}')})),
+      support_contact: supMap.contact||'evansmaina2026@gmail.com',
+      support_phone:   supMap.phone||'0114698986',
+      new_server_url:  newServer?.url||null, new_server_label: newServer?.label||null,
+    });
+  } catch(e) { err(res, e.message, 500); }
+});
+
+// Support Config
+app.get('/api/master/support-config', authMaster, async (req, res) => {
+  const rows = await qAll('SELECT key,value FROM support_config');
+  const cfg = {}; rows.forEach(r=>{cfg[r.key]=r.value;}); ok(res, cfg);
+});
+app.post('/api/master/support-config', authMaster, async (req, res) => {
+  const {contact,phone,name} = req.body;
+  if (contact) await q(`INSERT INTO support_config(key,value) VALUES('contact',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [contact]);
+  if (phone)   await q(`INSERT INTO support_config(key,value) VALUES('phone',$1)   ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [phone]);
+  if (name)    await q(`INSERT INTO support_config(key,value) VALUES('name',$1)    ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=NOW()`, [name]);
+  io.emit('support_update', {contact,phone,name});
+  await audit(req.master.email,'SUPPORT_CONFIG_UPDATE',null,`contact:${contact}`,req.ip);
+  ok(res, null, 'Support config updated and pushed to all devices');
+});
+
+// Device Lock/Unlock
+app.post('/api/master/shops/:id/lock', authMaster, async (req, res) => {
+  try {
+    const shopId = parseInt(req.params.id);
+    const {device_id,message,contact,phone} = req.body;
+    const support = await qAll('SELECT key,value FROM support_config');
+    const supMap = {}; support.forEach(s=>{supMap[s.key]=s.value;});
+    const lockMsg  = message||'This POS has been locked by the administrator.';
+    const lockCont = contact||supMap.contact||'evansmaina2026@gmail.com';
+    const lockPhone= phone||supMap.phone||'0114698986';
+    await q(`INSERT INTO device_locks(shop_id,device_id,locked,message,contact,phone,locked_by) VALUES($1,$2,1,$3,$4,$5,$6)`,
+      [shopId,device_id||null,lockMsg,lockCont,lockPhone,req.master.id]);
+    await q(`INSERT INTO remote_commands(shop_id,device_id,command,payload,issued_by) VALUES($1,$2,'LOCK_POS',$3,$4)`,
+      [shopId,device_id||null,JSON.stringify({message:lockMsg,contact:lockCont,phone:lockPhone}),req.master.id]);
+    const payload = {command:'LOCK_POS',payload:{message:lockMsg,contact:lockCont,phone:lockPhone}};
+    if (device_id) broadcastToDevice(device_id,'remote_command',payload);
+    else broadcastToShop(shopId,'remote_command',payload);
+    await audit(req.master.email,'POS_LOCK',`shop:${shopId}`,device_id||'all',req.ip);
+    ok(res,null,'Lock applied — online devices locked immediately, offline on reconnect');
+  } catch(e) { err(res,e.message,500); }
+});
+app.post('/api/master/shops/:id/unlock', authMaster, async (req, res) => {
+  try {
+    const shopId = parseInt(req.params.id);
+    const {device_id} = req.body;
+    await q(`UPDATE device_locks SET locked=0,unlocked_at=NOW() WHERE shop_id=$1 AND locked=1 AND (device_id IS NULL OR device_id=$2)`, [shopId,device_id||null]);
+    await q(`INSERT INTO remote_commands(shop_id,device_id,command,payload,issued_by) VALUES($1,$2,'UNLOCK_POS','{}' ,$3)`, [shopId,device_id||null,req.master.id]);
+    if (device_id) broadcastToDevice(device_id,'remote_command',{command:'UNLOCK_POS',payload:{}});
+    else broadcastToShop(shopId,'remote_command',{command:'UNLOCK_POS',payload:{}});
+    await audit(req.master.email,'POS_UNLOCK',`shop:${shopId}`,device_id||'all',req.ip);
+    ok(res,null,'Unlocked');
+  } catch(e) { err(res,e.message,500); }
+});
+
+// Modules
+app.get('/api/master/modules', authMaster, async (req, res) => {
+  ok(res, await qAll(`SELECT m.*,s.name as shop_name FROM modules m LEFT JOIN shops s ON m.shop_id=s.id ORDER BY m.created_at DESC`));
+});
+app.post('/api/master/modules', authMaster, async (req, res) => {
+  try {
+    const {module_id,shop_id,device_id,name,description,html,css,js,mount_point,force_reload} = req.body;
+    if (!module_id||!name) return err(res,'module_id and name required');
+    await q(`INSERT INTO modules(module_id,shop_id,device_id,name,description,html,css,js,mount_point,force_reload,created_by)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             ON CONFLICT(module_id,shop_id) DO UPDATE SET name=$4,description=$5,html=$6,css=$7,js=$8,mount_point=$9,force_reload=$10,active=1`,
+      [module_id,shop_id||null,device_id||null,name,description||null,html||null,css||null,js||null,mount_point||'app',force_reload?1:0,req.master.id]);
+    const modPay = {id:module_id,name,html:html||null,css:css||null,js:js||null,mount_point:mount_point||'app',force_reload:!!force_reload};
+    if (shop_id) { if(device_id) broadcastToDevice(device_id,'module_push',modPay); else broadcastToShop(parseInt(shop_id),'module_push',modPay); }
+    else io.emit('module_push',modPay);
+    await audit(req.master.email,'MODULE_PUSH',module_id,`shop:${shop_id||'all'}`,req.ip);
+    ok(res,null,'Module pushed');
+  } catch(e) { err(res,e.message,500); }
+});
+app.delete('/api/master/modules/:mid', authMaster, async (req, res) => {
+  const mod = await qOne('SELECT * FROM modules WHERE module_id=$1', [req.params.mid]);
+  if (!mod) return err(res,'Not found',404);
+  await q('UPDATE modules SET active=0 WHERE module_id=$1', [req.params.mid]);
+  const payload = {command:'REMOVE_MODULE',payload:{module_id:req.params.mid}};
+  if (mod.shop_id) broadcastToShop(mod.shop_id,'remote_command',payload);
+  else io.emit('remote_command',payload);
+  ok(res,null,'Module removed');
+});
+
+// Patches
+app.get('/api/master/patches', authMaster, async (req, res) => {
+  ok(res, await qAll(`SELECT p.*,s.name as shop_name FROM patches p LEFT JOIN shops s ON p.shop_id=s.id ORDER BY p.created_at DESC`));
+});
+app.post('/api/master/patches', authMaster, async (req, res) => {
+  try {
+    const {patch_id,shop_id,name,type,content,selector,action} = req.body;
+    if (!patch_id||!name||!type||!content) return err(res,'patch_id,name,type,content required');
+    if (!['css','js','html'].includes(type)) return err(res,'type must be css,js,html');
+    await q(`INSERT INTO patches(patch_id,shop_id,name,type,content,selector,action,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(patch_id) DO UPDATE SET name=$3,type=$4,content=$5,selector=$6,action=$7,active=1`,
+      [patch_id,shop_id||null,name,type,content,selector||null,action||'append',req.master.id]);
+    const patchPay = {id:patch_id,type,content,selector:selector||null,action:action||'append'};
+    if (shop_id) broadcastToShop(parseInt(shop_id),'patch_push',patchPay);
+    else io.emit('patch_push',patchPay);
+    await audit(req.master.email,'PATCH_PUSH',patch_id,`shop:${shop_id||'all'} type:${type}`,req.ip);
+    ok(res,null,'Patch pushed');
+  } catch(e) { err(res,e.message,500); }
+});
+app.delete('/api/master/patches/:pid', authMaster, async (req, res) => {
+  await q('UPDATE patches SET active=0 WHERE patch_id=$1', [req.params.pid]);
+  ok(res,null,'Patch deactivated');
+});
+
+// Server Config
+app.get('/api/master/server-config', authMaster, async (req, res) => {
+  ok(res, await qAll('SELECT * FROM server_config ORDER BY added_at DESC'));
+});
+app.post('/api/master/server-config', authMaster, async (req, res) => {
+  try {
+    const {label,url,notes} = req.body;
+    if (!label||!url) return err(res,'label and url required');
+    await q(`INSERT INTO server_config(label,url,notes,added_by) VALUES($1,$2,$3,$4) ON CONFLICT(url) DO UPDATE SET label=$1,notes=$3`,
+      [label,url.trim().replace(/\/$/,''),notes||null,req.master.id]);
+    await audit(req.master.email,'SERVER_ADD',url,label,req.ip);
+    ok(res,null,'Server added');
+  } catch(e) { err(res,e.message,500); }
+});
+app.post('/api/master/server-config/:id/activate', authMaster, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const svr = await qOne('SELECT * FROM server_config WHERE id=$1', [id]);
+    if (!svr) return err(res,'Not found',404);
+    await q('UPDATE server_config SET is_active=0');
+    await q('UPDATE server_config SET is_active=1 WHERE id=$1', [id]);
+    io.emit('server_switch',{new_url:svr.url,label:svr.label});
+    io.emit('remote_command',{command:'SWITCH_SERVER',payload:{new_url:svr.url,label:svr.label}});
+    const shops = await qAll("SELECT id FROM shops WHERE status='ACTIVE'");
+    for (const shop of shops) {
+      await q(`INSERT INTO remote_commands(shop_id,device_id,command,payload,issued_by) VALUES($1,NULL,'SWITCH_SERVER',$2,$3)`,
+        [shop.id,JSON.stringify({new_url:svr.url,label:svr.label}),req.master.id]);
+    }
+    await audit(req.master.email,'SERVER_ACTIVATE',svr.url,svr.label,req.ip);
+    ok(res,null,`Server "${svr.label}" activated and pushed to all devices`);
+  } catch(e) { err(res,e.message,500); }
+});
+app.delete('/api/master/server-config/:id', authMaster, async (req, res) => {
+  await q('DELETE FROM server_config WHERE id=$1', [parseInt(req.params.id)]);
+  ok(res,null,'Server removed');
+});
+
+// DB Export / Import
+app.get('/api/master/db/export', authSuper, async (req, res) => {
+  try {
+    const [owners,shops,devices,feats,subs,pymnts,reqs,mods,patches,support] = await Promise.all([
+      qAll('SELECT * FROM owners'),qAll('SELECT * FROM shops'),qAll('SELECT * FROM devices'),
+      qAll('SELECT * FROM feature_catalog'),qAll('SELECT * FROM subscriptions'),qAll('SELECT * FROM payments'),
+      qAll('SELECT * FROM feature_requests'),qAll('SELECT * FROM modules'),qAll('SELECT * FROM patches'),
+      qAll('SELECT * FROM support_config'),
+    ]);
+    const exportData = {version:'3.0',exported_at:new Date().toISOString(),owners,shops,devices,
+      feature_catalog:feats,subscriptions:subs,payments:pymnts,feature_requests:reqs,modules:mods,patches,support_config:support};
+    res.setHeader('Content-Type','application/json');
+    res.setHeader('Content-Disposition',`attachment; filename="distore-backup-${new Date().toISOString().split('T')[0]}.json"`);
+    res.send(JSON.stringify(exportData,null,2));
+    await audit(req.master.email,'DB_EXPORT',null,null,req.ip);
+  } catch(e) { err(res,e.message,500); }
+});
+app.post('/api/master/db/import', authSuper, async (req, res) => {
+  try {
+    const data = req.body;
+    if (!data.version||!data.owners) return err(res,'Invalid export file');
+    let imported = {owners:0,shops:0,features:0,subscriptions:0,payments:0};
+    for (const o of (data.owners||[])) {
+      try { await q(`INSERT INTO owners(email,password,name,business_name,phone,kra_pin,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(email) DO NOTHING`,
+        [o.email,o.password,o.name,o.business_name,o.phone,o.kra_pin,o.status||'ACTIVE',o.created_at]); imported.owners++; } catch(e) {}
+    }
+    for (const f of (data.feature_catalog||[])) {
+      try { await q(`INSERT INTO feature_catalog(key,name,description,price_kes,category,sort_order,active) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(key) DO NOTHING`,
+        [f.key,f.name,f.description,f.price_kes,f.category,f.sort_order,f.active]); imported.features++; } catch(e) {}
+    }
+    for (const s of (data.shops||[])) {
+      try { await q(`INSERT INTO shops(name,location,phone,email,kra_pin,license_key,status,plan,features,monthly_fee,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(license_key) DO NOTHING`,
+        [s.name,s.location,s.phone,s.email,s.kra_pin,s.license_key,s.status||'ACTIVE',s.plan||'BASIC',s.features||'{}',s.monthly_fee||0,s.expires_at]); imported.shops++; } catch(e) {}
+    }
+    for (const sub of (data.subscriptions||[])) {
+      try { await q(`INSERT INTO subscriptions(owner_id,shop_id,feature_key,status,price_kes,started_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
+        [sub.owner_id,sub.shop_id,sub.feature_key,sub.status,sub.price_kes,sub.started_at,sub.expires_at]); imported.subscriptions++; } catch(e) {}
+    }
+    for (const p of (data.payments||[])) {
+      try { await q(`INSERT INTO payments(owner_id,shop_id,feature_key,amount_kes,method,reference,description,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [p.owner_id,p.shop_id,p.feature_key,p.amount_kes,p.method,p.reference,p.description,p.created_at]); imported.payments++; } catch(e) {}
+    }
+    for (const sc of (data.support_config||[])) {
+      try { await q(`INSERT INTO support_config(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2`, [sc.key,sc.value]); } catch(e) {}
+    }
+    await audit(req.master.email,'DB_IMPORT',null,JSON.stringify(imported),req.ip);
+    ok(res,imported,`Imported: ${imported.owners} owners, ${imported.shops} shops, ${imported.subscriptions} subs`);
+  } catch(e) { err(res,e.message,500); }
+});
 
 // ══════════════════════════════════════════════════════════════
 //  SOCKET.IO
