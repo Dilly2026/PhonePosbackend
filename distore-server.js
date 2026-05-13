@@ -1279,6 +1279,11 @@ app.post('/api/master/db/import', authSuper, async (req, res) => {
   } catch(e) { err(res,e.message,500); }
 });
 
+// ── 404 catch-all ───────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ success: false, msg: `Route not found: ${req.method} ${req.path}` });
+});
+
 // ══════════════════════════════════════════════════════════════
 //  SOCKET.IO
 // ══════════════════════════════════════════════════════════════
@@ -1330,6 +1335,22 @@ setupDatabase().then(() => {
     console.log(`\n🚀  Distore Server v3.0 running on port ${PORT}`);
     console.log(`📊  API: /api/info`);
     console.log(`✅  Ready\n`);
+
+    // ── Self-ping to keep Render free tier awake ──────────────
+    // Render spins down free services after 15 min of inactivity.
+    // Ping every 14 minutes to keep it alive.
+    const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || null;
+    if (SELF_URL) {
+      setInterval(() => {
+        const url = SELF_URL.replace(/\/$/, '') + '/api/info';
+        const mod = url.startsWith('https') ? require('https') : require('http');
+        mod.get(url, (r) => { r.resume(); }).on('error', () => {});
+        console.log(`[keepalive] pinged ${url}`);
+      }, 14 * 60 * 1000); // every 14 minutes
+      console.log(`⏱️  Keepalive active → ${SELF_URL}`);
+    } else {
+      console.log(`ℹ️  Set RENDER_EXTERNAL_URL env var to enable keepalive (prevents Render sleep)`);
+    }
   });
 }).catch(e => {
   console.error('❌  Database setup failed:', e.message);
