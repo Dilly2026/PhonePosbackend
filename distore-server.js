@@ -575,15 +575,19 @@ app.put('/api/master/owners/:id', authMaster, async (req, res) => {
     const id = parseInt(req.params.id);
     const o  = await qOne('SELECT * FROM owners WHERE id=$1', [id]);
     if (!o) return err(res, 'Not found', 404);
-    const { name, business_name, phone, kra_pin, status, notes } = req.body;
+    const { name, business_name, phone, kra_pin, status, notes, password } = req.body;
     await q('UPDATE owners SET name=COALESCE($1,name), business_name=COALESCE($2,business_name), phone=$3, kra_pin=$4, status=COALESCE($5,status), notes=$6 WHERE id=$7',
       [name, business_name, phone, kra_pin, status, notes, id]);
+    // Update password separately if provided
+    if (password && password.trim().length >= 8) {
+      await q('UPDATE owners SET password=$1 WHERE id=$2', [bcrypt.hashSync(password.trim(), 10), id]);
+    }
     if (status === 'SUSPENDED' && o.status !== 'SUSPENDED') {
       await q("UPDATE shops SET status='SUSPENDED' WHERE owner_id=$1", [id]);
       const shops = await qAll('SELECT id FROM shops WHERE owner_id=$1', [id]);
       shops.forEach(s => broadcastToShop(s.id, 'remote_command', { command:'SHOP_SUSPENDED', payload:{ message:'Account suspended. Contact support.' } }));
     }
-    await audit(req.master.email, 'OWNER_UPDATE', o.email, `status:${status}`, req.ip);
+    await audit(req.master.email, 'OWNER_UPDATE', o.email, `status:${status}${password?',password_changed':''}`, req.ip);
     ok(res, null, 'Updated');
   } catch(e) { err(res, e.message, 500); }
 });
@@ -1279,11 +1283,6 @@ app.post('/api/master/db/import', authSuper, async (req, res) => {
   } catch(e) { err(res,e.message,500); }
 });
 
-// ── 404 catch-all ───────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ success: false, msg: `Route not found: ${req.method} ${req.path}` });
-});
-
 // ══════════════════════════════════════════════════════════════
 //  SOCKET.IO
 // ══════════════════════════════════════════════════════════════
@@ -1335,22 +1334,6 @@ setupDatabase().then(() => {
     console.log(`\n🚀  Distore Server v3.0 running on port ${PORT}`);
     console.log(`📊  API: /api/info`);
     console.log(`✅  Ready\n`);
-
-    // ── Self-ping to keep Render free tier awake ──────────────
-    // Render spins down free services after 15 min of inactivity.
-    // Ping every 14 minutes to keep it alive.
-    const SELF_URL = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || null;
-    if (SELF_URL) {
-      setInterval(() => {
-        const url = SELF_URL.replace(/\/$/, '') + '/api/info';
-        const mod = url.startsWith('https') ? require('https') : require('http');
-        mod.get(url, (r) => { r.resume(); }).on('error', () => {});
-        console.log(`[keepalive] pinged ${url}`);
-      }, 14 * 60 * 1000); // every 14 minutes
-      console.log(`⏱️  Keepalive active → ${SELF_URL}`);
-    } else {
-      console.log(`ℹ️  Set RENDER_EXTERNAL_URL env var to enable keepalive (prevents Render sleep)`);
-    }
   });
 }).catch(e => {
   console.error('❌  Database setup failed:', e.message);
