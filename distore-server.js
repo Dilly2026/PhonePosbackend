@@ -786,6 +786,27 @@ app.get('/api/master/shops/:id/stats', authMaster, async (req, res) => {
   } catch(e) { err(res, e.message, 500); }
 });
 
+// ── Master: product inventory across all shops (for label printer) ──
+app.get('/api/master/inventory', authMaster, async (req, res) => {
+  try {
+    // Get the latest product backup from every shop
+    const rows = await qAll(
+      `SELECT DISTINCT ON (shop_id) shop_id, data, synced_at
+       FROM cloud_backups
+       WHERE store_name = 'products'
+       ORDER BY shop_id, synced_at DESC`
+    );
+    let products = [];
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.data || '[]');
+        products = products.concat(parsed.map(p => ({ ...p, _shop_id: row.shop_id })));
+      } catch(e) {}
+    }
+    ok(res, products);
+  } catch(e) { err(res, e.message, 500); }
+});
+
 // ── Devices ───────────────────────────────────────────────────
 app.get('/api/master/devices', authMaster, async (req, res) => {
   ok(res, await qAll(`SELECT d.*, s.name AS shop_name, o.business_name as owner_name FROM devices d JOIN shops s ON d.shop_id=s.id LEFT JOIN owners o ON s.owner_id=o.id ORDER BY d.registered_at DESC`));
