@@ -1160,11 +1160,12 @@ app.post('/api/master/modules', authMaster, async (req, res) => {
   try {
     const {module_id,shop_id,device_id,name,description,html,css,js,mount_point,force_reload} = req.body;
     if (!module_id||!name) return err(res,'module_id and name required');
+    // PostgreSQL NULL!=NULL in unique constraints, so ON CONFLICT(module_id,shop_id)
+    // never fires for global modules (shop_id IS NULL). Use DELETE+INSERT instead.
     const sid = shop_id || null;
-    // PostgreSQL: NULL != NULL in unique constraints, so ON CONFLICT(module_id,shop_id)
-    // never matches when shop_id IS NULL (global modules). Use DELETE+INSERT instead.
     await q(`DELETE FROM modules WHERE module_id=$1 AND (shop_id=$2 OR (shop_id IS NULL AND $2::int IS NULL))`, [module_id, sid]);
-    await q(`INSERT INTO modules(module_id,shop_id,device_id,name,description,html,css,js,mount_point,force_reload,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    await q(`INSERT INTO modules(module_id,shop_id,device_id,name,description,html,css,js,mount_point,force_reload,created_by)
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
       [module_id,sid,device_id||null,name,description||null,html||null,css||null,js||null,mount_point||'app',force_reload?1:0,req.master.id]);
     const modPay = {id:module_id,name,html:html||null,css:css||null,js:js||null,mount_point:mount_point||'app',force_reload:!!force_reload};
     if (shop_id) { if(device_id) broadcastToDevice(device_id,'module_push',modPay); else broadcastToShop(parseInt(shop_id),'module_push',modPay); }
