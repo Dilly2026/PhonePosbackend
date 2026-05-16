@@ -344,24 +344,12 @@ async function setupDatabase() {
   await q(`CREATE INDEX IF NOT EXISTS idx_payments_owner   ON payments(owner_id)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_backups_shop     ON cloud_backups(shop_id)`);
 
-  // ── Schema migrations (safe to run on every boot) ────────────
-  // modules table was created without a UNIQUE constraint on
-  // (module_id, shop_id) but the INSERT uses ON CONFLICT on those
-  // columns — causing "no unique or exclusion constraint" error.
-  await q(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'modules_module_id_shop_id_key'
-      ) THEN
-        ALTER TABLE modules
-          ADD CONSTRAINT modules_module_id_shop_id_key
-          UNIQUE (module_id, shop_id);
-      END IF;
-    END
-    $$
-  `);
+  // Migration: add UNIQUE constraint to modules if missing
+  try {
+    await q(`ALTER TABLE modules ADD CONSTRAINT modules_module_id_shop_id_key UNIQUE (module_id, shop_id)`);
+  } catch(e) {
+    // constraint already exists or table not yet created - both fine
+  }
 
   console.log('✅  Database tables ready');
 
