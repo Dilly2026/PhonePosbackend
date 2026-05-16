@@ -208,8 +208,8 @@ async function setupDatabase() {
       reference    TEXT,
       description  TEXT,
       recorded_by  INTEGER REFERENCES master_users(id),
-      created_at   TIMESTAMP NOT NULL DEFAULT NOW()
-    )
+      created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (module_id, shop_id)
   `);
 
   await q(`
@@ -298,7 +298,8 @@ async function setupDatabase() {
     active       INTEGER NOT NULL DEFAULT 1,
     force_reload INTEGER NOT NULL DEFAULT 0,
     created_by   INTEGER REFERENCES master_users(id),
-    created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (module_id, shop_id)
   )`);
 
   await q(`CREATE TABLE IF NOT EXISTS patches (
@@ -342,6 +343,25 @@ async function setupDatabase() {
   await q(`CREATE INDEX IF NOT EXISTS idx_requests_status  ON feature_requests(status)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_payments_owner   ON payments(owner_id)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_backups_shop     ON cloud_backups(shop_id)`);
+
+  // ── Schema migrations (safe to run on every boot) ────────────
+  // modules table was created without a UNIQUE constraint on
+  // (module_id, shop_id) but the INSERT uses ON CONFLICT on those
+  // columns — causing "no unique or exclusion constraint" error.
+  await q(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'modules_module_id_shop_id_key'
+      ) THEN
+        ALTER TABLE modules
+          ADD CONSTRAINT modules_module_id_shop_id_key
+          UNIQUE (module_id, shop_id);
+      END IF;
+    END
+    $$
+  `);
 
   console.log('✅  Database tables ready');
 
@@ -783,27 +803,6 @@ app.get('/api/master/shops/:id/stats', authMaster, async (req, res) => {
     const ls = await qOne('SELECT MAX(synced_at) as ts FROM cloud_backups WHERE shop_id=$1', [id]);
     stats.device_count = parseInt(dc.c); stats.last_sync = ls?.ts;
     ok(res, stats);
-  } catch(e) { err(res, e.message, 500); }
-});
-
-// ── Master: product inventory across all shops (for label printer) ──
-app.get('/api/master/inventory', authMaster, async (req, res) => {
-  try {
-    // Get the latest product backup from every shop
-    const rows = await qAll(
-      `SELECT DISTINCT ON (shop_id) shop_id, data, synced_at
-       FROM cloud_backups
-       WHERE store_name = 'products'
-       ORDER BY shop_id, synced_at DESC`
-    );
-    let products = [];
-    for (const row of rows) {
-      try {
-        const parsed = JSON.parse(row.data || '[]');
-        products = products.concat(parsed.map(p => ({ ...p, _shop_id: row.shop_id })));
-      } catch(e) {}
-    }
-    ok(res, products);
   } catch(e) { err(res, e.message, 500); }
 });
 
