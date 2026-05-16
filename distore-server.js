@@ -208,8 +208,8 @@ async function setupDatabase() {
       reference    TEXT,
       description  TEXT,
       recorded_by  INTEGER REFERENCES master_users(id),
-      created_at   TIMESTAMP NOT NULL DEFAULT NOW(),
-    UNIQUE (module_id, shop_id)
+      created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+    )
   `);
 
   await q(`
