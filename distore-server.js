@@ -20,6 +20,8 @@
 const http   = require('http');
 const crypto = require('crypto');
 const os     = require('os');
+const path   = require('path');
+const fs     = require('fs');
 
 let express, socketIO, jwt, bcrypt, pg;
 try { express  = require('express');       } catch(e) { die('express');      }
@@ -1075,6 +1077,16 @@ app.get('/', (req, res) => res.send(`<!DOCTYPE html><html><head><title>Distore S
 // ══════════════════════════════════════════════════════════════
 //  ENFORCEMENT API
 // ══════════════════════════════════════════════════════════════
+// ── Serve distore-cloud.js so POS can load it on connect ────────
+// Place distore-cloud.js in the same folder as distore-server.js.
+app.get('/distore-cloud.js', (req, res) => {
+  const f = path.join(__dirname, 'distore-cloud.js');
+  if (!fs.existsSync(f)) return res.status(404).send('// distore-cloud.js not found on server');
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(f);
+});
+
 app.get('/api/pos/enforcements', authDevice, async (req, res) => {
   try {
     const shopId = req.shopId, deviceId = req.device.device_id;
